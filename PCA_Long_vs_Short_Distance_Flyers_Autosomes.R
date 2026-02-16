@@ -22,6 +22,9 @@ metadata <- read.table(metadata_file, header = TRUE, stringsAsFactors = FALSE)
 pca$IID <- as.character(pca$IID)
 metadata$IID <- as.character(metadata$IID)
 
+# FIX 1: Reconstruct full ID (e.g., NPO_146)
+pca$IID <- paste0("NPO_", pca$IID)
+
 # ---------------------------
 # MERGE PCA WITH METADATA
 # ---------------------------
@@ -48,13 +51,26 @@ ggplot(pca, aes(x = PC1, y = PC2, color = FlightType)) +
   stat_ellipse(level = 0.95) +      # 95% confidence ellipse
   theme_minimal() +
   labs(
-    title = "PCA of Racing Homers (Long vs Short Flyers, All Chromosomes)",
-    x = "PC1",
-    y = "PC2"
+    title = "PCA of Columba livia domestica (Long vs Short Distance Flyers, Autosomes)",
+    x = "PC1 (16.4%)",
+    y = "PC2 (12.9%)"
   ) +
-  theme(legend.position = "right") +
+  theme(
+    # Add solid axis lines
+    axis.line = element_line(color = "black", linewidth = 0.8),
+
+    # Increase font sizes
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 13),
+    plot.title = element_text(size = 18, face = "bold"),
+
+    legend.position = "right"
+  ) +
   scale_color_brewer(palette = "Set1")
 
 dev.off()
 
 cat("PCA plot saved to", output_file, "\n")
+
