@@ -1,0 +1,896 @@
+# Research Practice data management plan
+# Author & Researcher: Floris Verhoeve (1298399)
+# Research practice October 2025 - February 2026
+# Whole genome analysis of racing homer pigeons (Columba livia domestica): insights into selection, performance, and genetic diversity. 
+
+##1. Project overview
+This research practice researches genetic varation in a population of 148 racing homer pigeons (Columba livia domestica), specifically the genetic differences between long and short distance flyers and which genes could potentially influence these variations
+Supervisors: Pascal Duenk (WUR), Junxin Gao (WUR)
+
+##2. Data overview
+    I. The data used for this thesis can be found in /lustre/nobackup/WUR/ABGC/verho158
+    A. Data types
+        Raw data: Illumina short read sequencing data
+        Alignments:     BAM-formatted alignments to a reference genome of a related species for use in variance analysis
+                        VCF-formatted alignments to a reference genome of a related species for use in variance analysis
+
+    B. HPC Workflow
+        Modules/Pipelines used:
+                    - Population variant calling (https://github.com/CarolinaPB/population-variant-calling)
+                    - FastQC 0.12.1
+                    - MultiQC 1.31
+                    - fastp 1.0.1
+                    - BWA-MEM2 2.2.1
+                    - SAMtools 1.22.1
+                    - Picard 3.4.0 
+                    - Qualimap 2.3
+                    - Freebayes 1.3.10
+                    - vcflib / vcffilter 1.0.2
+                    - bcftools 1.22
+                    - PLINK 1.9
+                    - VCFtools 0.1.17
+                    - R 4.3.1
+                    - ggplo2 3.4.3
+                    - dplyr 1.1.2
+                    - data.table 1.14.8
+                    - g:Profiler 2025
+                    - MobaXterm 2024
+                    - SLURM (HPC workload manager)
+                    - Conda (Anaconda Software Distribution, 2020) 
+
+##3. Scripts
+    I. All scripts used are available through /lustre/nobackup/WUR/ABGC/verho158/scripts
+    II. All public available data has been deleted from the HPC, but can be found on the National Center for Biotechnology Information (NCBI) website per species
+    A. SBATCH file for quality control (QC) of all 148 samples 
+#!/bin/bash
+#SBATCH --job-name=QC_NPO
+#SBATCH --time=1-00:00:00
+#SBATCH -N 1
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --qos=Std
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/QC/slurm_output_QC_%A_%a.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/QC/slurm_error_QC_%A_%a.txt
+#SBATCH --array=1-148 # Default full array (override in sbatch command for testing)
+
+# Load Conda environment
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# Base directories
+base_dir="/lustre/nobackup/WUR/ABGC/verho158/WGS_Data"
+out_dir="/lustre/nobackup/WUR/ABGC/verho158/QC"
+
+# Determine sample name
+sample=$(printf "NPO_%d" $SLURM_ARRAY_TASK_ID)
+reads_dir="${base_dir}/${sample}"
+
+# Create sample-specific directories
+sample_out_dir="${out_dir}/${sample}"
+filtered_dir="${sample_out_dir}/filtered"
+mkdir -p $sample_out_dir $filtered_dir
+
+# Find FASTQ files
+fastq_files=(${reads_dir}/*.fq.gz)
+if [ ${#fastq_files[@]} -eq 0 ]; then
+    echo "No FASTQ files found for ${sample}, skipping..."
+    exit 1
+fi
+
+# Step 1: Run FastQC
+echo "Running FastQC for ${sample}..."
+fastqc -t 4 -o $sample_out_dir "${fastq_files[@]}"
+
+# Step 2: Run fastp filtering
+echo "Running fastp for ${sample}..."
+if [ ${#fastq_files[@]} -eq 2 ]; then
+    fastp \
+      -i ${fastq_files[0]} \
+      -I ${fastq_files[1]} \
+      -o ${filtered_dir}/${sample}_filtered_1.fq.gz \
+      -O ${filtered_dir}/${sample}_filtered_2.fq.gz \
+      -q 30 -l 36 -w 4 -D \
+      -h ${filtered_dir}/${sample}_fastp.html \
+      -j ${filtered_dir}/${sample}_fastp.json
+else
+    # Handle multiple paired FASTQs
+    for ((i=0; i<${#fastq_files[@]}; i+=2)); do
+        base_name="${sample}_filtered_$((i/2+1))"
+        fastp \
+          -i ${fastq_files[i]} \
+          -I ${fastq_files[i+1]} \
+          -o ${filtered_dir}/${base_name}_1.fq.gz \
+          -O ${filtered_dir}/${base_name}_2.fq.gz \
+          -q 30 -l 36 -w 4 -D \
+          -h ${filtered_dir}/${base_name}_fastp.html \
+          -j ${filtered_dir}/${base_name}_fastp.json
+    done
+fi
+
+# Deactivate Conda
+conda deactivate
+echo "QC and filtering completed successfully for ${sample}!"
+
+	B. SBATCH file for indexing the pigeon (columba livia) reference genome (GCF_036013475.1)
+#!/bin/bash
+#SBATCH --job-name=bwamem2_index
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --time=02:00:00
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/bwamem2_index_%j.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/bwamem2_index_%j.err
+
+# Load Conda environment
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# Reference genome path
+ref="/lustre/nobackup/WUR/ABGC/verho158/GCF_036013475.1_bColLiv1.pat.W.v2_genomic.fna"
+
+# Run BWA-MEM2 indexing
+echo "Indexing reference genome with BWA-MEM2..."
+bwa-mem2 index $ref
+
+echo "Indexing complete."
+conda deactivate
+
+	C. SBATCH file for mapping all 148 racing homer pigeon samples
+#!/bin/bash
+#SBATCH --job-name=map_NPO
+#SBATCH --time=2-00:00:00
+#SBATCH -N 1
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --qos=Std
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/mapping/slurm_out_map_%A_%a.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/mapping/slurm_err_map_%A_%a.txt
+#SBATCH --array=1-148% # Default full array (override in sbatch command for testing)
+
+# ---- load env ----
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# ---- vars ----
+sample=$(printf "NPO_%d" $SLURM_ARRAY_TASK_ID)
+reads_dir="/lustre/nobackup/WUR/ABGC/verho158/QC/${sample}/filtered"
+out_dir="/lustre/nobackup/WUR/ABGC/verho158/mapping/${sample}"
+ref="/lustre/nobackup/WUR/ABGC/verho158/bwa-mem2/GCF_036013475.1_bColLiv1.pat.W.v2_genomic.fna"
+
+mkdir -p "$out_dir"
+
+# ---- find read pairs (R1/R2 pattern) ----
+R1=( ${reads_dir}/*_1.fq.gz )
+R2=( ${reads_dir}/*_2.fq.gz )
+
+if [ ${#R1[@]} -eq 0 ] || [ ${#R1[@]} -ne ${#R2[@]} ]; then
+  echo "ERROR: no paired FASTQs or unmatched pairs for ${sample} in ${reads_dir}" >&2
+  exit 1
+fi
+
+# ---- map each pair to temporary BAM part files ----
+parts=()
+for ((i=0; i<${#R1[@]}; i++)); do
+  r1=${R1[i]}
+  r2=${R2[i]}
+  part="${out_dir}/${sample}_part_$((i+1)).bam"
+  echo "[$(date)] Mapping pair $((i+1)) for ${sample}: $r1 + $r2" >&2
+  bwa-mem2 mem -t ${SLURM_CPUS_ON_NODE:-4} "$ref" "$r1" "$r2" \
+    | samtools view -@ ${SLURM_CPUS_ON_NODE:-4} -b -o "$part" -
+  parts+=( "$part" )
+done
+
+# ---- if multiple parts, merge, else use single part ----
+if [ ${#parts[@]} -gt 1 ]; then
+  merged="${out_dir}/${sample}_merged.bam"
+  echo "[$(date)] Merging ${#parts[@]} parts into $merged" >&2
+  samtools merge -@ ${SLURM_CPUS_ON_NODE:-4} -f "$merged" "${parts[@]}"
+  rm -f "${parts[@]}"
+  input_bam="$merged"
+else
+  input_bam="${parts[0]}"
+fi
+
+# ---- sort (coordinate) ----
+sorted="${out_dir}/${sample}_sorted.bam"
+echo "[$(date)] Sorting to $sorted" >&2
+samtools sort -@ ${SLURM_CPUS_ON_NODE:-4} -o "$sorted" "$input_bam"
+rm -f "$input_bam"
+
+# ---- add read groups (using Picard) ----
+RGID="${sample}"
+RGLB="lib1"
+RGPL="ILLUMINA"
+RGPU="unit1"
+RGSM="${sample}"
+
+rg_bam="${out_dir}/${sample}_RG.bam"
+echo "[$(date)] Adding read groups" >&2
+picard AddOrReplaceReadGroups \
+  I="$sorted" O="$rg_bam" \
+  RGID="$RGID" RGLB="$RGLB" RGPL="$RGPL" RGPU="$RGPU" RGSM="$RGSM"
+rm -f "$sorted"
+
+# ---- mark duplicates (Picard) and create index ----
+dedup="${out_dir}/${sample}_dedup.bam"
+dupmetrics="${out_dir}/${sample}_dupmetrics.txt"
+echo "[$(date)] Marking duplicates" >&2
+picard MarkDuplicates I="$rg_bam" O="$dedup" M="$dupmetrics" CREATE_INDEX=true
+rm -f "$rg_bam"
+
+# ---- flagstat and coverage summary ----
+samtools flagstat "$dedup" > "${out_dir}/${sample}_flagstat.txt"
+
+samtools depth -a "$dedup" \
+  | awk '{sum+=$3; if($3>=1) c1++; if($3>=5) c5++; if($3>=10) c10++; if($3>=20) c20++; count++}
+         END {if(count>0) {print "avg:",sum/count; printf ">=1x: %.2f%%\n>=5x: %.2f%%\n>=10x: %.2f%%\n>=20x: %.2f%%\n",
+               100*c1/count, 100*c5/count, 100*c10/count, 100*c20/count } else print "No coverage"}' \
+  > "${out_dir}/${sample}_depth_summary.txt"
+
+# ---- done ----
+conda deactivate
+echo "[$(date)] Sample ${sample} mapping DONE" >&2
+
+	D. SBATCH file for creating summary metrics with Qualimap
+#!/bin/bash
+#SBATCH --job-name=QC_NPO
+#SBATCH --time=1-00:00:00
+#SBATCH -N 1
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --qos=Std
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/QC/slurm_output_QC_%A_%a.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/QC/slurm_error_QC_%A_%a.txt
+#SBATCH --array=1-148  # Adjust to your number of samples
+
+# Load Conda environment
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# Base directories
+bam_dir="/lustre/nobackup/WUR/ABGC/verho158/all_bams"
+out_dir="/lustre/nobackup/WUR/ABGC/verho158/QC"
+
+# Determine sample name based on SLURM_ARRAY_TASK_ID
+sample=$(printf "NPO_%d_dedup.bam" $SLURM_ARRAY_TASK_ID)
+bam_file="${bam_dir}/${sample}"
+
+# Check if BAM file exists
+if [ ! -f "$bam_file" ]; then
+    echo "BAM file not found for ${sample}, skipping..."
+    exit 1
+fi
+
+# Create output directory for sample
+sample_out_dir="${out_dir}/${sample%.bam}"
+mkdir -p "$sample_out_dir"
+
+# Resources for Qualimap
+threads=4
+java_mem_size="16G"
+
+# Run Qualimap BAM QC
+echo "Running Qualimap BAM QC for ${sample}..."
+unset DISPLAY  # prevent GUI issues on HPC
+
+qualimap bamqc \
+    -bam "$bam_file" \
+    -outdir "$sample_out_dir" \
+    -nt "$threads" \
+    --java-mem-size="$java_mem_size"
+
+echo "Qualimap BAM QC completed for ${sample}!"
+
+# Optional: extract per-chromosome coverage & MAPQ summary
+# genome_results.txt is generated by Qualimap
+genome_results="${sample_out_dir}/genome_results.txt"
+
+if [ -f "$genome_results" ]; then
+    echo "Extracting key metrics from genome_results.txt for ${sample}..."
+    awk '
+        BEGIN {print "Chromosome\tLength(bp)\tCovered(bp)\tMeanCoverage\tStdCoverage"}
+        /^>>>>>>> Coverage per contig/ {flag=1; next}
+        flag && /^[0-9XYMT]/ {
+            print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5
+        }
+        flag && /^$/{flag=0}
+    ' "$genome_results" > "${sample_out_dir}/${sample%.bam}_perContigCoverage.txt"
+
+    # Mapping quality summary
+    awk -F"=" '/mean mapping quality/ {print "Mean mapping quality: "$2}' "$genome_results" > "${sample_out_dir}/${sample%.bam}_MAPQ_summary.txt"
+    echo "Extraction done for ${sample}!"
+fi
+
+# Deactivate Conda
+conda deactivate
+echo "QC pipeline finished for ${sample}!"
+
+	E. SBATCH file for mapping all 148 racing homer pigeon samples
+
+#!/bin/bash
+#SBATCH --job-name=map_NPO
+#SBATCH --time=2-00:00:00
+#SBATCH -N 1
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --qos=Std
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/mapping/slurm_out_map_%A_%a.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/mapping/slurm_err_map_%A_%a.txt
+#SBATCH --array=1-148% # Default full array (override in sbatch command for testing)
+
+# ---- load env ----
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# ---- vars ----
+sample=$(printf "NPO_%d" $SLURM_ARRAY_TASK_ID)
+reads_dir="/lustre/nobackup/WUR/ABGC/verho158/QC/${sample}/filtered"
+out_dir="/lustre/nobackup/WUR/ABGC/verho158/mapping/${sample}"
+ref="/lustre/nobackup/WUR/ABGC/verho158/bwa-mem2/GCF_036013475.1_bColLiv1.pat.W.v2_genomic.fna"
+
+mkdir -p "$out_dir"
+
+# ---- find read pairs (R1/R2 pattern) ----
+R1=( ${reads_dir}/*_1.fq.gz )
+R2=( ${reads_dir}/*_2.fq.gz )
+
+if [ ${#R1[@]} -eq 0 ] || [ ${#R1[@]} -ne ${#R2[@]} ]; then
+  echo "ERROR: no paired FASTQs or unmatched pairs for ${sample} in ${reads_dir}" >&2
+  exit 1
+fi
+
+# ---- map each pair to temporary BAM part files ----
+parts=()
+for ((i=0; i<${#R1[@]}; i++)); do
+  r1=${R1[i]}
+  r2=${R2[i]}
+  part="${out_dir}/${sample}_part_$((i+1)).bam"
+  echo "[$(date)] Mapping pair $((i+1)) for ${sample}: $r1 + $r2" >&2
+  bwa-mem2 mem -t ${SLURM_CPUS_ON_NODE:-4} "$ref" "$r1" "$r2" \
+    | samtools view -@ ${SLURM_CPUS_ON_NODE:-4} -b -o "$part" -
+  parts+=( "$part" )
+done
+
+# ---- if multiple parts, merge, else use single part ----
+if [ ${#parts[@]} -gt 1 ]; then
+  merged="${out_dir}/${sample}_merged.bam"
+  echo "[$(date)] Merging ${#parts[@]} parts into $merged" >&2
+  samtools merge -@ ${SLURM_CPUS_ON_NODE:-4} -f "$merged" "${parts[@]}"
+  rm -f "${parts[@]}"
+  input_bam="$merged"
+else
+  input_bam="${parts[0]}"
+fi
+
+# ---- sort (coordinate) ----
+sorted="${out_dir}/${sample}_sorted.bam"
+echo "[$(date)] Sorting to $sorted" >&2
+samtools sort -@ ${SLURM_CPUS_ON_NODE:-4} -o "$sorted" "$input_bam"
+rm -f "$input_bam"
+
+# ---- add read groups (using Picard) ----
+RGID="${sample}"
+RGLB="lib1"
+RGPL="ILLUMINA"
+RGPU="unit1"
+RGSM="${sample}"
+
+rg_bam="${out_dir}/${sample}_RG.bam"
+echo "[$(date)] Adding read groups" >&2
+picard AddOrReplaceReadGroups \
+  I="$sorted" O="$rg_bam" \
+  RGID="$RGID" RGLB="$RGLB" RGPL="$RGPL" RGPU="$RGPU" RGSM="$RGSM"
+rm -f "$sorted"
+
+# ---- mark duplicates (Picard) and create index ----
+dedup="${out_dir}/${sample}_dedup.bam"
+dupmetrics="${out_dir}/${sample}_dupmetrics.txt"
+echo "[$(date)] Marking duplicates" >&2
+picard MarkDuplicates I="$rg_bam" O="$dedup" M="$dupmetrics" CREATE_INDEX=true
+rm -f "$rg_bam"
+
+# ---- flagstat and coverage summary ----
+samtools flagstat "$dedup" > "${out_dir}/${sample}_flagstat.txt"
+
+samtools depth -a "$dedup" \
+  | awk '{sum+=$3; if($3>=1) c1++; if($3>=5) c5++; if($3>=10) c10++; if($3>=20) c20++; count++}
+         END {if(count>0) {print "avg:",sum/count; printf ">=1x: %.2f%%\n>=5x: %.2f%%\n>=10x: %.2f%%\n>=20x: %.2f%%\n",
+               100*c1/count, 100*c5/count, 100*c10/count, 100*c20/count } else print "No coverage"}' \
+  > "${out_dir}/${sample}_depth_summary.txt"
+
+# ---- done ----
+conda deactivate
+echo "[$(date)] Sample ${sample} mapping DONE" >&2
+
+	F. SBATCH file for Freebayes population variant calling
+
+#!/bin/bash
+#SBATCH --job-name=freebayes_148_samples
+#SBATCH --time=9-00:00:00
+#SBATCH -N 1
+#SBATCH -c 12
+#SBATCH --mem=32000
+#SBATCH --qos=Std
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/slurm_out_freebayes_%A.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/slurm_err_freebayes_%A.txt
+
+# Set TMPDIR to home directory (writable)
+export TMPDIR=$HOME/tmp_freebayes
+mkdir -p "$TMPDIR" || { echo "ERROR: TMPDIR not writable"; exit 1; }
+echo "Using TMPDIR: $TMPDIR"
+df -h "$TMPDIR"
+
+# Load conda environment
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# Input / output directories
+bam_list_file="/lustre/nobackup/WUR/ABGC/verho158/all_bams/bam_list.txt"
+ref="/lustre/nobackup/WUR/ABGC/verho158/bwa-mem2/GCF_036013475.1_bColLiv1.pat.W.v2_genomic.fna"
+scripts_dir="/lustre/nobackup/WUR/ABGC/verho158/scripts"
+regions="/lustre/nobackup/WUR/ABGC/verho158/scripts/regions_all_chr.txt"
+
+outdir="/lustre/nobackup/WUR/ABGC/verho158/results/variant_calling"
+mkdir -p "$outdir"
+
+vcf_out="${outdir}/pigeon_population_joint_freebayes.vcf.gz"
+
+echo "[$(date)] Starting joint Freebayes calling on 148 samples" >&2
+echo "Using BAM list: $bam_list_file" >&2
+
+# Run Freebayes joint calling
+${scripts_dir}/freebayes-parallel.sh \
+    ${regions} 12 \
+    -f "$ref" \
+    --use-best-n-alleles 2 \
+    --min-base-quality 10 \
+    --min-alternate-fraction 0.2 \
+    --min-alternate-count 2 \
+    --haplotype-length 0 \
+    --ploidy 2 \
+    -L "$bam_list_file" \
+| vcffilter -f "QUAL > 20 & DP > 3" \
+| bgzip -c > "$vcf_out"
+
+# Index the VCF
+tabix -p vcf "$vcf_out"
+
+echo "[$(date)] Finished joint Freebayes calling" >&2
+
+conda deactivate
+
+	G. SBATCH file for freebayes-parallel used for Freebayes population variant calling
+
+#!/usr/bin/env bash
+# from https://github.com/freebayes/freebayes/blob/master/scripts/freebayes-parallel
+
+if [ $# -lt 3 ];
+then
+    echo "usage: $0 [regions file] [ncpus] [freebayes arguments]"
+    echo
+    echo "Run freebayes in parallel over regions listed in regions file, using ncpus processors."
+    echo "Will merge and sort output, producing a uniform VCF stream on stdout.  Flags to freebayes"
+    echo "which would write to e.g. a particular file will obviously cause problms, so caution is"
+    echo "encouraged when using this script."
+    echo
+    echo "examples:"
+    echo
+    echo "Run freebayes in parallel on 100000bp chunks of the ref (fasta_generate_regions.py is also"
+    echo "located in the scripts/ directory in the freebayes distribution).  Use 36 threads."
+    echo
+    echo "    freebayes-parallel <(fasta_generate_regions.py ref.fa.fai 100000) 36 -f ref.fa aln.bam >out.vcf"
+    echo
+    echo "Generate regions that are equal in terms of data content, and thus have lower variance"
+    echo "in runtime.  This will yield better resource utilization."
+    echo
+    echo "    bamtools coverage -in aln.bam | coverage_to_regions.py ref.fa.fai 500 >ref.fa.500.regions"
+    echo "    freebayes-parallel ref.fa.500.regions 36 -f ref.fa aln.bam >out.vcf"
+    echo
+    exit
+fi
+
+regionsfile=$1
+shift
+ncpus=$1
+shift
+
+command=("freebayes" "$@")
+
+(
+#$command | head -100 | grep "^#" # generate header
+# iterate over regions using gnu parallel to dispatch jobs
+cat "$regionsfile" | parallel -k -j "$ncpus" "${command[@]}" --region {}
+) | vcffirstheader \
+    | vcfstreamsort -w 1000 | vcfuniq # remove duplicates at region edges
+
+	H. Rscript for fasta_generate_regions used for population variant calling
+
+#!/usr/bin/env python3
+# from https://github.com/freebayes/freebayes/blob/master/scripts/fasta_generate_regions.py
+import argparse
+from math import ceil
+
+
+def generate_regions(fasta_index_file, size, chunks=False, chromosomes=None, bed_files=None):
+
+    if not fasta_index_file.endswith(".fai"):
+        fasta_index_file = fasta_index_file + ".fai"
+
+    with open(fasta_index_file, "r") as fasta_index:
+        for line in fasta_index:
+            fields = line.strip().split("\t")
+            chrom_name = fields[0]
+            chrom_length = int(fields[1])
+            if chromosomes is not None and chrom_name not in chromosomes:
+                continue
+            region_start = 0
+            if chunks is True:
+                region_size = ceil(chrom_length / size)  # have to make sure this works
+            else:
+                region_size = size
+            while region_start < chrom_length:
+                region_end = region_start + region_size
+                if region_end > chrom_length:
+                    region_end = chrom_length
+                start = str(region_start)
+                end = str(region_end)
+                if bed_files is not None:
+                    region = str(ceil(region_end / region_size))
+                    file_path = f"{bed_files}.{chrom_name}.region.{region}.bed"
+                    with open(file_path, "w") as f:
+                        f.write("\t".join([chrom_name, start, end]))
+                else:
+                    print(f"{chrom_name}:{start}-{end}")
+                region_start = region_end
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Generates a list of freebayes/bamtools region specifiers. Intended "
+                                                 "for parallelization or creating cluster jobs.")
+
+    parser.add_argument("--chunks", action="store_true",
+                        help="Split the fasta into N chunks rather than into N length pieces")
+    parser.add_argument("--chromosomes", nargs="+", default=None,
+                        help="List of chromosomes to create chunks for")
+    parser.add_argument("--bed", metavar="base name", type=str,
+                        help="Write chunks to individual bed files (for Snakemake) instead of stdout.")
+    parser.add_argument("fai", metavar="<fasta or fai file>",
+                        help="The fasta file to split. Must be indexed.")
+    parser.add_argument("region_size", metavar="<N>", type=int,
+                        help="Region size")
+
+    args = parser.parse_args()
+    generate_regions(args.fai, args.region_size, chunks=args.chunks, chromosomes=args.chromosomes, bed_files=args.bed)
+
+	I. Rscript for creating PCA plot for long vs short distance flyers
+
+#!/usr/bin/env Rscript
+
+library(ggplot2)
+library(dplyr)
+
+# ---------------------------
+# CONFIG PATHS
+# ---------------------------
+pca_file <- "pigeons_pca.eigenvec"  # Output from PLINK PCA
+metadata_file <- "metadata.txt"      # Must include IID and FlightType
+output_file <- "pca_long_vs_short_all_chr.png"
+
+# ---------------------------
+# LOAD DATA
+# ---------------------------
+pca <- read.table(pca_file, header = FALSE, stringsAsFactors = FALSE)
+colnames(pca) <- c("FID", "IID", paste0("PC", 1:10))
+
+metadata <- read.table(metadata_file, header = TRUE, stringsAsFactors = FALSE)
+
+# Ensure IID columns are character for merging
+pca$IID <- as.character(pca$IID)
+metadata$IID <- as.character(metadata$IID)
+
+# FIX 1: Reconstruct full ID (e.g., NPO_146)
+pca$IID <- paste0("NPO_", pca$IID)
+
+# ---------------------------
+# MERGE PCA WITH METADATA
+# ---------------------------
+pca <- left_join(pca, metadata, by = "IID")
+
+# Check for missing FlightType
+if (any(is.na(pca$FlightType))) warning("Some PCA samples did not match metadata.")
+
+# ---------------------------
+# FILTER TO LONG VS SHORT
+# ---------------------------
+pca <- pca %>% filter(FlightType %in% c("Long", "Short"))
+
+cat("Number of samples per flight type:\n")
+print(table(pca$FlightType))
+
+# ---------------------------
+# PLOT PCA (PC1 vs PC2)
+# ---------------------------
+png(output_file, width = 900, height = 700)
+
+ggplot(pca, aes(x = PC1, y = PC2, color = FlightType)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(level = 0.95) +      # 95% confidence ellipse
+  theme_minimal() +
+  labs(
+    title = "PCA of Columba livia domestica (Long vs Short Distance Flyers, Autosomes)",
+    x = "PC1 (16.4%)",
+    y = "PC2 (12.9%)"
+  ) +
+  theme(
+    # Add solid axis lines
+    axis.line = element_line(color = "black", linewidth = 0.8),
+
+    # Increase font sizes
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 13),
+    plot.title = element_text(size = 18, face = "bold"),
+
+    legend.position = "right"
+  ) +
+  scale_color_brewer(palette = "Set1")
+
+dev.off()
+
+cat("PCA plot saved to", output_file, "\n")
+
+	J. Rscript for creating PCA for males vs females
+
+#!/usr/bin/env Rscript
+
+library(ggplot2)
+library(dplyr)
+
+# ---------------------------
+# CONFIG PATHS
+# ---------------------------
+pca_file <- "pigeons_sexchr_pca.eigenvec"   # PCA output from sex chromosomes
+metadata_file <- "metadata.txt"              # Must include IID and Sex
+output_file <- "pca_sexchr_male_vs_female.png"
+
+# ---------------------------
+# LOAD DATA
+# ---------------------------
+pca <- read.table(pca_file, header = FALSE, stringsAsFactors = FALSE)
+colnames(pca) <- c("FID", "IID", paste0("PC", 1:10))
+
+metadata <- read.table(metadata_file, header = TRUE, stringsAsFactors = FALSE)
+
+# Ensure IID columns are character for merging
+pca$IID <- as.character(pca$IID)
+metadata$IID <- as.character(metadata$IID)
+
+# ---------------------------
+# FIX: Reconstruct full ID to match metadata
+# ---------------------------
+pca$IID <- paste0("NPO_", pca$IID)
+
+# ---------------------------
+# MERGE PCA WITH METADATA
+# ---------------------------
+pca <- left_join(pca, metadata, by = "IID")
+
+# ---------------------------
+# FILTER TO MALES AND FEMALES
+# ---------------------------
+pca <- pca %>% filter(Sex %in% c("Male", "Female"))
+
+# ---------------------------
+# CHECK SAMPLE COUNTS
+# ---------------------------
+cat("Number of samples per sex:\n")
+print(table(pca$Sex))
+
+# ---------------------------
+# PLOT PCA (PC1 vs PC2)
+# ---------------------------
+png(output_file, width = 900, height = 700)
+
+ggplot(pca, aes(x = PC1, y = PC2, color = Sex)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(level = 0.95) +       # 95% confidence ellipse
+  theme_minimal() +
+  labs(
+    title = "PCA of Columba livia domestica (Males vs Females, Sex Chromosomes)",
+    x = "PC1 (22.6%)",
+    y = "PC2 (12.8%)"
+  ) +
+  theme(
+    # Solid axes
+    axis.line = element_line(color = "black", linewidth = 0.8),
+
+    # Font size improvements
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 13),
+    plot.title = element_text(size = 18, face = "bold"),
+
+    legend.position = "right"
+  ) +
+  scale_color_brewer(palette = "Set1")
+
+dev.off()
+
+cat("PCA plot saved to", output_file, "\n")
+
+	K. Rscript for creating FST Manhattanplot for top 1%
+
+# fst_manhattan_candidates.R
+# Generate a Manhattan plot of Weir & Cockerham FST values with autosome labels
+# Also extract candidate SNPs based on top FST values
+
+library(data.table)
+library(ggplot2)
+
+# ---- Step 1: Load FST data ----
+fst_file <- "long_vs_short.weir.fst"
+fst <- fread(fst_file)
+
+# Remove missing or negative FST values
+fst <- fst[!is.na(WEIR_AND_COCKERHAM_FST) & WEIR_AND_COCKERHAM_FST >= 0]
+
+# ---- Step 2: Define chromosome order and sizes ----
+chrom_order <- c(
+  "NC_088602.1","NC_088603.1","NC_088604.1","NC_088605.1","NC_088606.1",
+  "NC_088607.1","NC_088608.1","NC_088609.1","NC_088610.1","NC_088611.1",
+  "NC_088612.1","NC_088613.1","NC_088614.1","NC_088615.1","NC_088616.1",
+  "NC_088617.1","NC_088618.1","NC_088619.1","NC_088620.1","NC_088621.1",
+  "NC_088622.1","NC_088623.1","NC_088624.1","NC_088625.1","NC_088626.1",
+  "NC_088627.1","NC_088628.1","NC_088629.1","NC_088630.1","NC_088631.1",
+  "NC_088632.1","NC_088633.1","NC_088634.1","NC_088635.1","NC_088636.1",
+  "NC_088637.1","NC_088638.1","NC_088639.1","NC_088640.1","NC_088641.1","NC_088642.1"
+)
+
+chrom_sizes <- c(
+  212386202, 163726572, 122092291, 78855516, 68980706, 41865730, 41451919,
+  34522999, 29946398, 23263835, 22349698, 21496342, 21485835, 20651115,
+  17800093, 15524004, 14482990, 14042120, 11817371, 11100612, 9002469,
+  7344926, 6871264, 6290118, 6129807, 5959470, 4741841, 3632745, 3051461,
+  1359805, 1272592, 689683, 564255, 538117, 489914, 459057, 302372, 276054,
+  204328, 238678768, 84824678
+)
+
+# ---- Step 2b: Keep only autosomes ----
+autosomes <- chrom_order[1:39]       # only true autosomes (exclude W/Z)
+fst <- fst[CHROM %in% autosomes]
+
+# ---- Step 3: Compute cumulative positions ----
+fst$CHROM <- factor(fst$CHROM, levels = autosomes)
+cumsum_sizes <- cumsum(c(0, chrom_sizes[1:39][-length(autosomes)]))
+names(cumsum_sizes) <- autosomes
+fst[, BPcum := POS + cumsum_sizes[as.character(CHROM)]]
+
+axisdf <- fst[, .(center = mean(BPcum)), by = CHROM]
+axisdf$label <- paste0("Chr", 1:39)  # relabel for plotting
+
+# ---- Step 4: Select candidate SNPs (top 1%) ----
+fst_threshold <- quantile(fst$WEIR_AND_COCKERHAM_FST, 0.99)
+candidates <- fst[WEIR_AND_COCKERHAM_FST >= fst_threshold]
+
+# Save candidate SNPs to CSV
+fwrite(candidates, "candidate_SNPs_top1pct.csv")
+
+cat("Number of candidate SNPs (top 1%):", nrow(candidates), "\n")
+cat("Threshold FST for top 1%:", round(fst_threshold, 3), "\n")
+
+# ---- Step 5: Generate Manhattan plot ----
+manhattan_plot <- ggplot(fst, aes(x = BPcum, y = WEIR_AND_COCKERHAM_FST)) +
+  geom_point(aes(color = CHROM), alpha = 0.6, size = 0.8) +
+  geom_point(data = candidates, color = "red", size = 1) + # highlight top SNPs
+  scale_x_continuous(label = axisdf$label, breaks = axisdf$center) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_color_manual(values = rep(c("grey30","grey70"), length.out = length(autosomes))) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    
+    # --- Improved aesthetics ---
+    axis.line = element_line(color = "black", linewidth = 0.8),  # solid axes
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 18, face = "bold")
+  ) +
+  xlab("Chromosome") +
+  ylab("Weir & Cockerham FST") +
+  ggtitle("FST Manhattan Plot (Autosomes Only) with Candidate SNPs Highlighted")
+
+# Save plot
+ggsave("FST_Manhattan_candidates_autosomes.png", plot = manhattan_plot, width = 12, height = 6)
+
+	L. Rscript for creating FST Manhattanplot for threshold with FST > 0.4
+
+# fst_manhattan_candidates_FST0.4.R
+# Generate a Manhattan plot of Weir & Cockerham FST values (autosomes only)
+# Select highly differentiated SNPs with FST >= 0.4
+# Save candidate SNPs (CHROM + POS) for annotation
+
+library(data.table)
+library(ggplot2)
+
+# ---- Step 1: Load FST data ----
+fst_file <- "long_vs_short.weir.fst"
+fst <- fread(fst_file)
+
+# Remove missing or negative FST values
+fst <- fst[!is.na(WEIR_AND_COCKERHAM_FST) & WEIR_AND_COCKERHAM_FST >= 0]
+
+# ---- Step 2: Define chromosome order and sizes ----
+chrom_order <- c(
+  "NC_088602.1","NC_088603.1","NC_088604.1","NC_088605.1","NC_088606.1",
+  "NC_088607.1","NC_088608.1","NC_088609.1","NC_088610.1","NC_088611.1",
+  "NC_088612.1","NC_088613.1","NC_088614.1","NC_088615.1","NC_088616.1",
+  "NC_088617.1","NC_088618.1","NC_088619.1","NC_088620.1","NC_088621.1",
+  "NC_088622.1","NC_088623.1","NC_088624.1","NC_088625.1","NC_088626.1",
+  "NC_088627.1","NC_088628.1","NC_088629.1","NC_088630.1","NC_088631.1",
+  "NC_088632.1","NC_088633.1","NC_088634.1","NC_088635.1","NC_088636.1",
+  "NC_088637.1","NC_088638.1","NC_088639.1","NC_088640.1","NC_088641.1","NC_088642.1"
+)
+
+chrom_sizes <- c(
+  212386202, 163726572, 122092291, 78855516, 68980706, 41865730, 41451919,
+  34522999, 29946398, 23263835, 22349698, 21496342, 21485835, 20651115,
+  17800093, 15524004, 14482990, 14042120, 11817371, 11100612, 9002469,
+  7344926, 6871264, 6290118, 6129807, 5959470, 4741841, 3632745, 3051461,
+  1359805, 1272592, 689683, 564255, 538117, 489914, 459057, 302372, 276054,
+  204328, 238678768, 84824678
+)
+
+# ---- Step 2b: Keep only autosomes ----
+autosomes <- chrom_order[1:39]      # only true autosomes
+fst <- fst[CHROM %in% autosomes]
+
+# ---- Step 3: Compute cumulative positions ----
+fst$CHROM <- factor(fst$CHROM, levels = autosomes)
+cumsum_sizes <- cumsum(c(0, chrom_sizes[1:39][-length(autosomes)]))
+names(cumsum_sizes) <- autosomes
+fst[, BPcum := POS + cumsum_sizes[as.character(CHROM)]]
+
+axisdf <- fst[, .(center = mean(BPcum)), by = CHROM]
+axisdf$label <- paste0("Chr", 1:39)  # relabel for plotting
+
+# ---- Step 4: Select candidate SNPs ----
+fst_threshold <- 0.4
+candidates <- fst[WEIR_AND_COCKERHAM_FST >= fst_threshold]
+
+# Save candidate SNPs (CHROM + POS) for annotation
+fwrite(candidates[, .(CHROM, POS)], "candidate_SNPs_FST0.4_autosomes.csv")
+
+cat("Number of candidate SNPs (FST >= 0.4):", nrow(candidates), "\n")
+cat("Threshold FST used:", fst_threshold, "\n")
+
+# ---- Step 5: Generate Manhattan plot ----
+manhattan_plot <- ggplot(fst, aes(x = BPcum, y = WEIR_AND_COCKERHAM_FST)) +
+  geom_point(aes(color = CHROM), alpha = 0.6, size = 0.8) +
+  geom_point(data = candidates, color = "red", size = 1) + # highlight top SNPs
+  scale_x_continuous(label = axisdf$label, breaks = axisdf$center) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_color_manual(values = rep(c("grey30","grey70"), length.out = length(autosomes))) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    
+    # --- Improved aesthetics ---
+    axis.line = element_line(color = "black", linewidth = 0.8),  # solid axes
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 18, face = "bold")
+  ) +
+  xlab("Chromosome") +
+  ylab("Weir & Cockerham FST") +
+  ggtitle("FST Manhattan Plot (Autosomes Only, FST >= 0.4 Highlighted)")
+
+# Save plot
+ggsave("FST_Manhattan_candidates_FST0.4_autosomes.png", plot = manhattan_plot, width = 12, height = 6)
