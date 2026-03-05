@@ -1,0 +1,108 @@
+#!/bin/bash
+#SBATCH --job-name=mtDNA_map
+#SBATCH --time=12:00:00
+#SBATCH -N 1
+#SBATCH -c 4
+#SBATCH --mem=16000
+#SBATCH --qos=Std
+#SBATCH --array=1-148
+#SBATCH --output=/lustre/nobackup/WUR/ABGC/verho158/mapping/mtDNA/slurm_out_%A_%a.txt
+#SBATCH --error=/lustre/nobackup/WUR/ABGC/verho158/mapping/mtDNA/slurm_err_%A_%a.txt
+
+# ---- activate environment ----
+source /home/WUR/verho158/miniconda3/etc/profile.d/conda.sh
+conda activate pigeon_env
+
+# ---- sample name ----
+sample=$(printf "NPO_%d" $SLURM_ARRAY_TASK_ID)
+
+reads_dir="/lustre/nobackup/WUR/ABGC/verho158/QC/${sample}/filtered"
+out_dir="/lustre/nobackup/WUR/ABGC/verho158/mapping/mtDNA/${sample}"
+ref="/lustre/nobackup/WUR/ABGC/verho158/columba_livia_mtDNA.fa"
+
+mkdir -p "$out_dir"
+
+echo "Processing $sample"
+echo "Reads directory: $reads_dir"
+
+# ---- detect lanes ----
+R1=( ${reads_dir}/*_1_1.fq.gz ${reads_dir}/*_2_1.fq.gz )
+R2=( ${reads_dir}/*_1_2.fq.gz ${reads_dir}/*_2_2.fq.gz )
+
+# ---- check reads exist ----
+if [ ! -f "${R1[0]}" ]; then
+    echo "ERROR: No reads found for $sample"
+    exit 1
+fi
+
+parts=()
+
+# ---- mapping per lane ----
+for ((i=0; i<${#R1[@]}; i++)); do
+
+    r1=${R1[$i]}
+    r2=${R2[$i]}
+
+    part="${out_dir}/${sample}_lane$((i+1)).bam"
+
+    echo "Mapping lane $((i+1))"
+    echo "$r1"
+    echo "$r2"
+
+    bwa-mem2 mem -t ${SLURM_CPUS_ON_NODE:-4} "$ref" "$r1" "$r2" \
+    | samtools view -@ ${SLURM_CPUS_ON_NODE:-4} -b -o "$part" -
+
+    parts+=( "$part" )
+
+done
+
+# ---- merge lanes if needed ----
+if [ ${#parts[@]} -gt 1 ]; then
+
+    merged="${out_dir}/${sample}_merged.bam"
+
+    samtools merge -@ ${SLURM_CPUS_ON_NODE:-4} -f "$merged" "${parts[@]}"
+
+    rm "${parts[@]}"
+
+else
+
+    merged="${parts[0]}"
+
+fi
+
+# ---- sort bam ----
+sorted="${out_dir}/${sample}_mtDNA.sorted.bam"
+
+samtools sort -@ ${SLURM_CPUS_ON_NODE:-4} -o "$sorted" "$merged"
+
+rm "$merged"
+
+# ---- index bam ----
+samtools index "$sorted"
+
+# ---- mapping stats ----
+samtools flagstat "$sorted" > "${out_dir}/${sample}_mtDNA_flagstat.txt"
+
+# ---- coverage summary ----
+samtools depth -a "$sorted" \
+| awk '{sum+=$3; if($3>=1)c1++; if($3>=5)c5++; if($3>=10)c10++; if($3>=20)c20++; count++}
+END {
+if(count>0){
+print "avg:",sum/count;
+printf ">=1x: %.2f%%\n>=5x: %.2f%%\n>=10x: %.2f%%\n>=20x: %.2f%%\n",
+100*c1/count,100*c5/count,100*c10/count,100*c20/count
+}else{
+print "No coverage"
+}}' > "${out_dir}/${sample}_mtDNA_depth_summary.txt"
+
+# ---- variant calling ----
+bcftools mpileup -f "$ref" "$sorted" -Ou \
+| bcftools call -mv -Oz \
+-o "${out_dir}/${sample}_mtDNA.vcf.gz"
+
+bcftools index "${out_dir}/${sample}_mtDNA.vcf.gz"
+
+echo "Finished $sample"
+
+conda deactivate
